@@ -1,0 +1,1554 @@
+/*
+ * Copyright (c) 2022
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation;
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ *
+ * Author: Sebastien Deronne <sebastien.deronne@gmail.com>
+ */
+
+#include "ns3/boolean.h"
+#include "ns3/command-line.h"
+#include "ns3/config.h"
+#include "ns3/double.h"
+#include "ns3/eht-phy.h"
+#include "ns3/enum.h"
+#include "ns3/internet-stack-helper.h"
+#include "ns3/ipv4-address-helper.h"
+#include "ns3/log.h"
+#include "ns3/mobility-helper.h"
+#include "ns3/multi-model-spectrum-channel.h"
+#include "ns3/on-off-helper.h"
+#include "ns3/packet-sink-helper.h"
+#include "ns3/packet-sink.h"
+#include "ns3/spectrum-wifi-helper.h"
+#include "ns3/ssid.h"
+#include "ns3/string.h"
+#include "ns3/udp-client-server-helper.h"
+#include "ns3/udp-server.h"
+#include "ns3/uinteger.h"
+#include "ns3/wifi-acknowledgment.h"
+#include "ns3/yans-wifi-channel.h"
+#include "ns3/yans-wifi-helper.h"
+
+#include <array>
+#include <functional>
+#include <numeric>
+#include "ns3/attribute-container.h"
+#include "ns3/wifi-module.h"
+
+#include "ns3/ipv4-address-helper.h"
+#include "ns3/ipv4-global-routing-helper.h"
+#include "ns3/flow-monitor-module.h"
+#include "ns3/attribute-container.h"
+
+#include "ns3/propagation-loss-model.h"
+#include "ns3/wifi-net-device.h"
+#include "ns3/ap-wifi-mac.h"
+#include "ns3/sta-wifi-mac.h"
+#include "ns3/wifi-mac.h"
+#include "ns3/config-store.h"
+#include "ns3/node-list.h"
+#include "ns3/ap-wifi-mac.h"
+#include "ns3/sta-wifi-mac.h"
+#include "ns3/wifi-mac.h"
+#include "ns3/eht-phy.h"
+#include <iomanip>
+#include <iostream>
+#include <sstream>
+#include <set>
+#include <cstdint>  // For uint8_t
+#include "ns3/wifi-tx-vector.h"
+#include "ns3/wifi-mode.h"
+
+
+// This is an example of  how to configure an IEEE 802.11be Wi-Fi network.
+// The simulation assumes a configurable number of stations in an infrastructure network:
+//  STA     AP
+//    *     *
+//    |     |
+//   n1     n2
+//
+// Packets in this simulation belong to BestEffort Access Class (AC_BE).
+// By selecting an acknowledgment sequence for DL MU PPDUs, it is possible to aggregate a
+// Round Robin scheduler to the AP, so that DL MU PPDUs are sent by the AP via DL OFDMA.
+
+
+using namespace ns3;
+NS_LOG_COMPONENT_DEFINE("eht-wifi-networktrial");
+std::ofstream LatecnyCdfFile;
+
+std::ofstream phyTxTraceFile;   ///< File that traces PHY transmissions  over time
+std::ofstream phyPsduTxTraceFile;   ///< File that traces PHY transmissions  over time
+std::ofstream phyRxTraceFile;   ///< File that traces PHY transmissions  over time
+std::ofstream packetsTimeStampsFile;
+std::ofstream packetsTimeFile;
+
+std::ofstream packetsTxfile;
+std::ofstream packetsRxfile;
+
+std::ofstream throughputINCfile;
+std::ofstream latecnyINCfile;
+std::ofstream AvglatecnyINCfile;
+
+
+
+
+
+/**
+ * \param serverApp a container of server applications
+ * \param payloadSize the size in bytes of the packets
+ * \return the bytes received by each server application
+ */
+std::vector<uint64_t>
+GetRxBytes(const ApplicationContainer* serverApp, uint32_t payloadSize)
+{
+    std::vector<uint64_t> rxBytes(serverApp->GetN() , 0);
+    for (uint32_t i = 0; i < serverApp->GetN() ; i++)
+    {   
+       rxBytes[i] = payloadSize * DynamicCast<UdpServer>(serverApp->Get(i))->GetReceived();
+    }
+  
+    return rxBytes;
+}  
+
+
+/**
+ * Print average throughput over an intermediate time interval.
+ * \param rxBytes a vector of the amount of bytes received by each server application
+ * \param serverApp a container of server applications
+ * \param payloadSize the size in bytes of the packets
+ * \param tputInterval the duration of an intermediate time interval
+ * \param simulationTime the simulation time in seconds
+ */
+
+void
+PrintIntermediateTput(std::vector<uint64_t>* rxBytes,
+                      const ApplicationContainer* serverApp,
+                      uint32_t payloadSize,
+                      Time tputInterval,
+                      Time simulationTime)
+{
+    auto newRxBytes = GetRxBytes(serverApp, payloadSize);
+    Time now = Simulator::Now();
+ 
+    std::cout << "[" << (now - tputInterval).As(Time::S) << " - " << now.As(Time::S)
+              << "] Per-STA Throughput (Mbit/s):";
+ 
+    for (std::size_t i = 0; i < newRxBytes.size(); i++)
+    {  
+        std::cout << "\t\t(" << i << ") "
+                  << (newRxBytes[i] - (*rxBytes)[i]) * 8. / tputInterval.GetMicroSeconds(); // Mbit/s
+    }
+    std::cout << std::endl;
+ 
+    *rxBytes = std::move(newRxBytes);  // Avoid rxBytes.swap(), as rxBytes is a pointer 
+     if (now < (simulationTime - NanoSeconds(1)))
+    {
+        Simulator::Schedule(Min(tputInterval, simulationTime - now - NanoSeconds(1)),
+                            &PrintIntermediateTput,
+                            rxBytes,
+                            serverApp,
+                            payloadSize,
+                            tputInterval,
+                            simulationTime);
+    }
+}
+
+
+
+/**
+ * \param serverApp a container of server applications
+ * \param payloadSize the size in bytes of the packets
+ * \return the bytes received by each server application
+ */
+
+std::vector<double>
+GetRxThroughput(const ApplicationContainer* serverApp, uint32_t payloadSize)
+{
+    std::vector<double> rxpackets(serverApp->GetN() , 0);
+    for (uint32_t i = 0; i < serverApp->GetN() ; i++)
+    {   
+       rxpackets[i] = DynamicCast<UdpServer>(serverApp->Get(i))->GetReceived();
+    }  
+    return rxpackets;
+}  
+
+
+/**
+ * Print average throughput over an intermediate time interval.
+ * \param rxBytes a vector of the amount of bytes received by each server application
+ * \param serverApp a container of server applications
+ * \param payloadSize the size in bytes of the packets
+ * \param tputInterval the duration of an intermediate time interval
+ * \param simulationTime the simulation time in seconds
+ */
+
+void
+PrintTputIncrement(const ApplicationContainer* serverApp,
+                   const std::map<Ipv4Address, std::map<uint64_t, Time>>* sendTimestamps,
+                   const std::map<Ipv4Address, std::map<uint64_t, Time>>* receiveTimestamps,
+                   uint32_t payloadSize,
+                   Time tputInterval,
+                   Time simulationTime)
+{
+    //Get number of packets 
+    auto RxPackets = GetRxThroughput(serverApp, payloadSize);
+   
+    // Get the latency experienced by the first packet transmitted and last packet received 
+    double timeDifference = 0;
+    double numPackets  = 0;
+
+    std::vector<std::pair<Ipv4Address, std::pair<double, double> >> addressTimeDifferences; 
+    for (const auto &sendEntry  : *sendTimestamps) {
+        Ipv4Address address = sendEntry.first; // The current destination address
+        const auto &sendPackets  = sendEntry.second;
+
+        // Check if the destination exists in the receiveTimestamps
+        auto receiveIt = receiveTimestamps->find(address);
+        if (receiveIt == receiveTimestamps->end())
+        {
+            std::cout << "No packets received for address: " << address << std::endl;
+            continue;
+        }
+        const auto& receivePackets = receiveIt->second;
+
+        // Ensure there are packets in both maps
+        if (sendPackets.empty() || receivePackets.empty())
+        {
+            std::cout << "Incomplete data for address: " << address << std::endl;
+            continue;
+        }
+
+        // Get the earliest send time (first packet in the send map)
+        Time firstSendTime = sendPackets.begin()->second;
+
+        // Get the latest receive time (last packet in the receive map)
+        Time lastReceiveTime = receivePackets.rbegin()->second;
+
+
+        // Calculate the time difference
+        timeDifference = (lastReceiveTime - firstSendTime).GetSeconds();
+        numPackets = (double)(receivePackets.size()); 
+        addressTimeDifferences.emplace_back(address, std::make_pair(timeDifference, numPackets));
+    }
+
+
+    Time now = Simulator::Now();
+    throughputINCfile << "[" << (now - tputInterval).As(Time::S) << " - " << now.As(Time::S)
+            << "] Per-STA Throughput (Mbit/s):";
+
+    for (std::size_t i = 0; i <addressTimeDifferences.size() ; i++)
+    {  
+        double pckts  = addressTimeDifferences[i].second.second; ;
+        double time = addressTimeDifferences[i].second.first; ;
+        double throughput = (pckts * payloadSize * 8) / (time) / 1024 / 1024;
+        //std::cout << "\t(" << addressTimeDifferences[i].first << ") " << throughput; // packets
+        throughputINCfile << "\t(" << i << ") " << throughput; // packets
+
+    }
+    throughputINCfile << std::endl;
+
+    if (now < (simulationTime - NanoSeconds(1)))
+    {
+        Simulator::Schedule(Min(tputInterval, simulationTime - now - NanoSeconds(1)),
+                            &PrintTputIncrement,
+                            serverApp,
+                            sendTimestamps,
+                            receiveTimestamps,
+                            payloadSize,
+                            tputInterval,
+                            simulationTime);
+    }
+}
+
+
+
+/**
+ * Print average throughput over an intermediate time interval.
+ * \param rxBytes a vector of the amount of bytes received by each server application
+ * \param serverApp a container of server applications
+ * \param payloadSize the size in bytes of the packets
+ * \param tputInterval the duration of an intermediate time interval
+ * \param simulationTime the simulation time in seconds
+ */
+
+void
+PrintLatencyIncrement(const ApplicationContainer* serverApp,
+                    std::map<Ipv4Address, std::map<uint64_t, Time>>* sendTimestamps,
+                    std::map<Ipv4Address, std::map<uint64_t, Time>>* receiveTimestamps,
+                   uint32_t payloadSize,
+                   Time tputInterval,
+                   Time simulationTime)
+{
+    std::vector<std::pair<Ipv4Address, double>> latenciesInc;  
+    std::vector<std::pair<Ipv4Address, double>> avglatenciesInc;  
+    for (const auto &destEntry : *receiveTimestamps) {
+        Ipv4Address destAddress = destEntry.first;
+        const auto &packets = destEntry.second;
+        //std::cout << destAddress << std::endl;
+        double avg_latency = 0;
+        double latencycum = 0;
+        for (const auto &packetEntry : packets) {
+            uint64_t packetId = packetEntry.first;
+            Time receiveTime = packetEntry.second;
+
+            // Look up the corresponding send time
+            auto sendIt = (*sendTimestamps)[destAddress].find(packetId);
+            if (sendIt != (*sendTimestamps)[destAddress].end()) {
+                Time sendTime = sendIt->second;
+
+                // Calculate the latency in seconds
+                double latency = (receiveTime - sendTime).GetSeconds();
+
+                // Store the latency in the packetLatencies map
+                latencycum += latency;
+
+            } 
+            else {
+                std::cerr << "Send timestamp not found for Packet ID: " << packetId << " at destination address.\n";
+            }
+        }
+        double packets_number = (double)(packets.size());
+        avg_latency =latencycum/packets_number;
+
+        latenciesInc.emplace_back(destAddress, latencycum);
+        avglatenciesInc.emplace_back(destAddress, avg_latency);
+    }
+    
+ 
+    Time now = Simulator::Now();
+    latecnyINCfile << "[" << (now - tputInterval).As(Time::S) << " - " << now.As(Time::S)
+            << "] Per-STA Latency (s):";
+
+    for (std::size_t i = 0; i < latenciesInc.size(); i++) {
+        latecnyINCfile << "\t(" << i << ") " << latenciesInc[i].second ; // packets
+        //std::cout << "Address: " << entry.first << ", Latency: " << entry.second << std::endl;
+    }
+    latecnyINCfile << std::endl;
+
+    AvglatecnyINCfile << "[" << (now - tputInterval).As(Time::S) << " - " << now.As(Time::S)
+            << "] Per-STA Latency (s):";
+
+    for (std::size_t i = 0; i < latenciesInc.size(); i++) {
+        AvglatecnyINCfile << "\t(" << i << ") " << avglatenciesInc[i].second ; // packets
+        //std::cout << "Address: " << entry.first << ", Latency: " << entry.second << std::endl;
+    }
+    AvglatecnyINCfile << std::endl;
+
+    if (now < (simulationTime - NanoSeconds(1)))
+    {
+        Simulator::Schedule(Min(tputInterval, simulationTime - now - NanoSeconds(1)),
+                            &PrintLatencyIncrement,
+                            serverApp,
+                            sendTimestamps,
+                            receiveTimestamps,
+                            payloadSize,
+                            tputInterval,
+                            simulationTime);
+    }
+}
+
+
+
+
+
+Ipv4Address
+ContextToIp(std::string context)
+{
+    // Retrieve the node and its IP address
+    std::string sub = context.substr(10);
+    uint32_t pos = sub.find("/Device");
+    uint32_t nodeId = std::stoi(sub.substr(0, pos));
+
+    // Retrieve the node and its IP address
+    Ptr<Node> node = NodeList::GetNode(nodeId);
+    Ptr<Ipv4> ipv4 = node->GetObject<Ipv4>();
+    Ipv4Address serverIpAddress = ipv4->GetAddress(1, 0).GetLocal();  // Adjust interface index as needed
+    return serverIpAddress;
+}
+
+int Tx_udp_packets = 0;
+std::map<Ipv4Address, std::map<uint64_t, Time>> sendTimestamps;  // Address -> (PacketID -> Send Time)
+void
+ClientTxAdd(std::string context, Ptr<const Packet> p, const Address &srcAddress, const Address &destAddress)
+{   
+    Ipv4Address srcAddress_corr = ContextToIp(context);
+    //std::cout << InetSocketAddress::ConvertFrom(srcAddress_corr).GetIpv4() << std::endl;
+    //std::cout << InetSocketAddress::ConvertFrom(destAddress).GetIpv4() << std::endl;
+    Ipv4Address destAddressIp = InetSocketAddress::ConvertFrom(destAddress).GetIpv4();
+    uint64_t packetId = p->GetUid();
+    Time sendTime = Simulator::Now();
+    sendTimestamps[destAddressIp][packetId] = sendTime;
+    Tx_udp_packets++;
+
+    packetsTxfile << "Aya At "<< Simulator::Now().GetSeconds() << " Packet number " << Tx_udp_packets 
+    <<  " transmitted from " << srcAddress_corr << std::endl;
+}
+
+uint32_t targetPacketCount = 1000;
+uint32_t Rx_udp_packets = 0;
+uint32_t count_packetnumber = 0;
+std::map<Ipv4Address, std::map<uint64_t, Time>> receiveTimestamps;  // Address -> (PacketID -> Receive Time)
+void
+ServerRxAdd(std::string context, Ptr<const Packet> p, const Address &srcAddress, const Address &destAddress)
+{   
+    //std::cout << InetSocketAddress::ConvertFrom(srcAddress).GetIpv4() << std::endl;
+    Ipv4Address destAddress_corr = ContextToIp(context);
+    //std::cout << destAddress_corr << std::endl;
+    uint64_t packetId = p->GetUid();
+    Time receiveTime  = Simulator::Now();
+    receiveTimestamps[destAddress_corr][packetId] = receiveTime;
+
+    count_packetnumber ++;
+    packetsTimeStampsFile << "At " << Simulator::Now().GetSeconds() << " Packet number" << count_packetnumber 
+    <<  " arrived from " << InetSocketAddress::ConvertFrom(srcAddress).GetIpv4() << std::endl;
+
+    packetsTimeFile << Simulator::Now().GetSeconds();
+    packetsTimeFile << ",";
+
+    packetsRxfile << "At "<< Simulator::Now().GetSeconds() << " Packet number " << count_packetnumber 
+    <<  " received at " << destAddress_corr << std::endl;
+
+    /*
+    Ipv4Address target_add("192.168.1.1");
+    if (destAddress_corr == target_add)
+    {
+        Rx_udp_packets++;
+        if (Rx_udp_packets >= targetPacketCount)
+        {
+            NS_LOG_INFO("Target packet count reached! Stopping simulation.");
+            Simulator::Stop(); // Stop the simulation
+        }
+    }
+    */
+}
+
+
+// Function to print send time stamps
+void PrintSendTimestamps(const std::map<Ipv4Address, std::map<uint64_t, Time>>& sendTimestamps) {
+    // Iterate over each address in the outer map
+    for (const auto& addressEntry : sendTimestamps) {
+        Ipv4Address address = addressEntry.first;
+        const auto& packetsMap = addressEntry.second;
+
+        // Print the address (using InetSocketAddress to convert from Address to IPv4 address)
+        std::cout << "Address: " << address << std::endl;
+
+        // Print each packet ID and its send time within this address
+        for (const auto& packetEntry : packetsMap) {
+            uint64_t packetId = packetEntry.first;
+            Time sendTime = packetEntry.second;
+
+            std::cout << "  Packet ID: " << packetId << ", Send Time: " << sendTime.GetSeconds() << " seconds" << std::endl;
+        }
+
+        // Print the count of packets associated with the address
+        std::cout << "  Total packets for this address: " << packetsMap.size() << std::endl;
+    }
+
+    // Print the total number of unique addresses in sendTimestamps
+    std::cout << "Total unique addresses: " << sendTimestamps.size() << std::endl;
+}
+
+// Function to print receive time stamps
+void PrintReceiveTimestamps(const std::map<Ipv4Address, std::map<uint64_t, Time>>& receiveTimestamps) {
+    // Iterate over each address in the outer map
+    for (const auto& addressEntry : receiveTimestamps) {
+        Ipv4Address address = addressEntry.first;
+        const auto& packetsMap = addressEntry.second;
+
+        // Print the address (using InetSocketAddress to convert from Address to IPv4 address)
+        std::cout << "Address: " << address << std::endl;
+
+        // Print each packet ID and its send time within this address
+        for (const auto& packetEntry : packetsMap) {
+            uint64_t packetId = packetEntry.first;
+            Time sendTime = packetEntry.second;
+
+            std::cout << "  Packet ID: " << packetId << ", Send Time: " << sendTime.GetSeconds() << " seconds" << std::endl;
+        }
+
+        // Print the count of packets associated with the address
+        std::cout << "  Total packets for this address: " << packetsMap.size() << std::endl;
+    }
+
+    // Print the total number of unique addresses in sendTimestamps
+    std::cout << "Total unique addresses: " << sendTimestamps.size() << std::endl;
+}
+
+std::map<Ipv4Address, std::vector<double>> packetLatencies; // Address -> [List of Latencies in ms]
+std::map<Ipv4Address, double> Averagelatencies; // Address -> [List of Latencies in ms]
+
+// Function to calculate latencies for each packet
+void CalculateLatencies() {
+    for (const auto &destEntry : receiveTimestamps) {
+        Ipv4Address destAddress = destEntry.first;
+        const auto &packets = destEntry.second;
+        //std::cout << destAddress << std::endl;
+        double avg_latency = 0;
+        for (const auto &packetEntry : packets) {
+            uint64_t packetId = packetEntry.first;
+            Time receiveTime = packetEntry.second;
+
+            // Look up the corresponding send time
+            auto sendIt = sendTimestamps[destAddress].find(packetId);
+            if (sendIt != sendTimestamps[destAddress].end()) {
+                Time sendTime = sendIt->second;
+
+                // Calculate the latency in milliseconds
+                double latency = (receiveTime - sendTime).GetSeconds();
+
+                // Store the latency in the packetLatencies map
+                packetLatencies[destAddress].push_back(latency);
+                avg_latency += latency;
+
+            } 
+            else {
+                std::cerr << "Send timestamp not found for Packet ID: " << packetId << " at destination address.\n";
+            }
+        }
+        double packets_number = (double)(packets.size());
+        Averagelatencies[destAddress]=avg_latency/packets_number;
+    }
+}
+
+// print latencies for each address
+void PrintEachLatency() 
+{
+    for (const auto &latencyEntry : packetLatencies) {
+        Ipv4Address destAddress = latencyEntry.first;
+        const std::vector<double> &latencies = latencyEntry.second;
+
+        std::cout << "Latencies for address " << destAddress << ":\n";
+        for (double latency : latencies) {
+            std::cout << latency << " ms, ";
+        }
+        std::cout << std::endl;
+    }
+}
+
+// print total average latency
+void PrintAverageLatency() 
+{
+    for (const auto &latencyEntry : Averagelatencies) {
+    Ipv4Address destAddress = latencyEntry.first;
+    double latencies = latencyEntry.second;
+
+    std::cout << "Average latencies for  address " << destAddress << " is: "
+                << latencies << " s" << std::endl;
+    }
+}
+
+int txCountPsdu_firstlink = 0;
+int txCountPsdu_secondlink = 0;
+int txCount_psdu = 0;
+void Transmit( uint8_t phyId, WifiConstPsduMap psduMap, WifiTxVector txVector, double txPowerW)
+{
+    // loop on the psdu map to process each entry in the psdu and log information about each psdu
+    //std::cout << "Txing on link " <<  (int)phyId << std::endl;
+    for (const auto& psduPair : psduMap)
+    {   
+        std::stringstream ss;
+        ss << " " << psduPair.second->GetHeader(0).GetTypeString() << " seq "
+           << psduPair.second->GetHeader(0).GetSequenceNumber() << " from "
+           << psduPair.second->GetAddr2() << " to " << psduPair.second->GetAddr1() << " and size " << psduPair.second->GetSize();
+        //std::cout << ss.str() << std::endl;
+        //std::cout << " TXVECTOR " << txVector << std::endl;
+    }    
+    if (psduMap.begin()->second->GetHeader(0).IsQosData())
+    { 
+        if (phyId == 0)
+        { 
+            txCountPsdu_firstlink ++;
+            txCount_psdu ++ ;
+            Time txDuration = WifiPhy::CalculateTxDuration(psduMap, txVector, WIFI_PHY_BAND_2_4GHZ);
+            phyPsduTxTraceFile << "PSDU number " <<  txCount_psdu << " transmitted on link " << (int)phyId 
+                        << " at "<< Simulator::Now().GetSeconds() <<  " with duration " <<  txDuration.GetSeconds()    
+                        << " and size " << psduMap.begin()->second->GetSize() << " bytes"  << std::endl;
+        }
+        else
+        {
+            txCountPsdu_secondlink ++;
+            txCount_psdu ++;
+            Time txDuration = WifiPhy::CalculateTxDuration(psduMap, txVector, WIFI_PHY_BAND_5GHZ);
+            phyPsduTxTraceFile << "PSDU number " <<  txCount_psdu << " transmitted on link " << (int)phyId 
+                        << " at "<<  Simulator::Now().GetSeconds() <<  " with duration " << txDuration.GetSeconds()  
+                        << " and size " <<psduMap.begin()->second->GetSize() << " bytes"  << std::endl;
+        }
+    }
+}
+
+void
+PhyTxTraceParameters(WifiConstPsduMap psduMap, WifiTxVector txVector, double txPowerW)
+{
+   uint16_t ch_width_check  = txVector.GetChannelWidth();
+   uint16_t NSS_check  = txVector. GetNss() ; 
+   std::cout << "ch_width_check " << ch_width_check << std::endl;
+   std::cout << "NSS_check " << NSS_check << std::endl;
+
+   WifiMode mode =  txVector.GetMode ();
+   std::cout << "TX with mode: " << mode << ", bitrate: " << mode.GetDataRate(ch_width_check) / 1e6 << " Mbps" << std::endl;    
+   /*
+   if (psduMap.begin()->second->GetHeader(0).IsQosData())
+   { 
+       std::cout << "TX with mode: " << mode << ", bitrate: " << mode.GetDataRate(ch_width_check) / 1e6 << " Mbps" << std::endl;    
+   }
+       */
+}
+
+
+
+
+int txCount_link1 = 0;
+int txCount_link2 = 0;
+int txCount = 0;
+uint32_t payloadSize = 1500;
+/**
+ * PHY TX trace
+ *
+ * \param context The context.
+ * \param p The packet.
+ * \param txPowerW The TX power.
+ */
+void PhyTxTrace(uint8_t phyId, Ptr<const Packet> p, double txPowerW)
+{
+    NS_LOG_INFO("PHY-TX-START time=" << Simulator::Now() 
+                                     << " size=" << p->GetSize() << " " << txPowerW);
+    if (p->GetSize() >= payloadSize) // ignore non-data frames
+    {
+        if (phyId == 0)
+        { 
+            txCount_link1 ++;
+            txCount ++ ;
+            phyTxTraceFile << "Packet number " <<  txCount << " transmitted on link " << (int)phyId 
+                        << " at "<<  Simulator::Now().GetSeconds()  
+                        << " with size " << p->GetSize() << " bytes"  << std::endl;
+        }
+        else
+        {
+            txCount_link2 ++;
+            txCount ++ ;
+            phyTxTraceFile << "Packet number " <<  txCount << " transmitted on link " << (int)phyId 
+                        << " at "<<  Simulator::Now().GetSeconds()  
+                        << " with size " << p->GetSize() << " bytes"  << std::endl;
+        }
+    }
+}
+
+
+/**
+ * Parse context strings of the form "/NodeList/x/DeviceList/x/..." to extract the NodeId integer
+ *
+ * \param context The context to parse.
+ * \return the NodeId
+ */
+uint32_t
+ContextToNodeId(std::string context)
+{
+    std::string sub = context.substr(10);
+    uint32_t pos = sub.find("/Device");
+    return std::stoi(sub.substr(0, pos));
+}
+
+
+
+int count_numberBackoffs = 0;
+void BackoffTrace( uint32_t newVal, uint8_t linkId)
+{
+         //std::cout << "Backoff started "<<  Simulator::Now().GetSeconds() << " " << ContextToNodeId(context) << " "
+         //                << newVal << std::endl;
+         count_numberBackoffs ++;
+         //std::cout << "count_numberBackoffs" << count_numberBackoffs << std::endl;
+}
+
+
+int count_packetnumber2 = 0;
+void PacketArrivalCallback(Ptr<const Packet> packet, const Address &address)
+{
+    count_packetnumber2 ++;
+    packetsTimeStampsFile << "At "<< Simulator::Now().GetSeconds() << " Packet number" << count_packetnumber2 
+    <<  " arrived from " << InetSocketAddress::ConvertFrom(address).GetIpv4() << std::endl;
+}
+
+
+
+void
+PhyRxDoneTrace(Ptr<const Packet> p)
+{
+    if (p->GetSize() >= payloadSize) // ignore non-data frames
+    {
+       phyRxTraceFile << "At " << Simulator::Now() <<  " data packet with size= " << p->GetSize() << " is finish receiving" << std::endl;    
+    }
+    else
+    {
+       //std::cout << "At " << Simulator::Now() <<  "control packet with size= " << p->GetSize() << " is finish receiving" << std::endl;    
+    }
+}
+
+
+int Phytxnumber = 0;
+void
+PhyTxTest(Ptr<const Packet> p,  double txPowerW)
+{
+    if (p->GetSize() >= payloadSize) // ignore non-data frames
+    {
+       Phytxnumber ++;
+       phyTxTraceFile << "At " << Simulator::Now() <<  " data packet with size= " << p->GetSize() << " number" << Phytxnumber << " is start transmitting" << std::endl;    
+    }
+    else
+    {
+       //std::cout << "At " << Simulator::Now() <<  "control packet with size= " << p->GetSize() << " is start transmitting" << std::endl;    
+    }
+}
+
+
+int PSDUnumber = 0;
+void
+PhyTxPSDUTest(WifiConstPsduMap psduMap, WifiTxVector txVector, double txPowerW)
+{
+    if (psduMap.begin()->second->GetHeader(0).IsQosData()) // ignore non-data frames
+    {
+       PSDUnumber ++;
+       phyPsduTxTraceFile << "At " << Simulator::Now() <<  " PSDU number" << PSDUnumber <<  "is start transmitting" << std::endl;    
+    }
+    else
+    {
+       //std::cout << "At " << Simulator::Now() <<  "control packet with size= " << p->GetSize() << " is start transmitting" << std::endl;    
+    }
+}
+
+void
+RateChange(uint64_t oldValue, uint64_t newValue)
+{
+  
+     std::cout << "The old value " << oldValue/1000000 <<  " with the new value " << newValue/1000000 << " b/s" << std::endl;    
+
+}
+
+
+
+
+int
+main(int argc, char* argv[])
+{
+
+// Parameters 
+bool udp{true}; // Application used either TCP/UDP
+bool downlink{false}; // Downlink/ UL
+bool useRts{true}; //Use RTS/CTS or not
+Time simulationTime{"10s"}; //seconds
+double distance{10.0};      // meters
+std::size_t nStations{1};
+double frequency{2.4};       // whether the first link operates in the 2.4, 5 or 6 GHz
+double frequency2{5}; // whether the second link operates in the 2.4, 5 or 6 GHz (0 means no second link exists)
+double frequency3{0}; // whether the third link operates in the 2.4, 5 or 6 GHz (0 means no third link exists)
+int mcs{10}; // -1 indicates an unset value
+uint16_t mpduBufferSize{1024}; //64 
+Time accessReqInterval{"1s"};
+std::string dlAckSeqType{"NO-OFDMA"};
+bool enableUlOfdma{false};
+bool enableBsrp{false};
+//uint32_t number_packets = 10;
+uint32_t number_packets = 4294967295U;
+uint16_t channelWidth = 20;
+uint16_t gi = 800;
+uint32_t payloadSize = 1500;  //1500
+
+bool verbose{false};
+bool tracing{false};
+bool enablePcap{true};
+Time tputInterval = Seconds(0.1); // interval for detailed throughput measurement
+
+
+/* EMLSR Parameters */ 
+std::string emlsrLinks = "0,1";
+bool EMLSR_mode{true};
+
+
+
+
+//std::set<uint8_t> emlsrLinks = {"0", "1", "2"};    //Not working sedfined as a set of strings
+uint16_t paddingDelayUsec{32};
+uint16_t transitionDelayUsec{128};
+uint16_t channelSwitchDelayUsec{100};
+bool switchAuxPhy{true};
+bool auxPhyTxCapable{true};
+uint16_t auxPhyChWidth{channelWidth};
+//uint16_t mainPhyId{0};
+
+uint16_t antennas_AP = 1;
+uint16_t antennas_Sta = 1;
+
+
+// Parsing using the commandline 
+CommandLine cmd(__FILE__);
+cmd.AddValue("number_packets",
+             "Max number of transmitted packets",
+              number_packets);
+cmd.AddValue("frequency",
+              "Whether the first link operates in the 2.4, 5 or 6 GHz band (other values gets rejected)",
+              frequency);
+cmd.AddValue("frequency2",
+            "Whether the second link operates in the 2.4, 5 or 6 GHz band (0 means the device has one "
+            "link, otherwise the band must be different than first link and third link)",
+            frequency2);
+cmd.AddValue("frequency3",
+            "Whether the third link operates in the 2.4, 5 or 6 GHz band (0 means the device has up to "
+            "two links, otherwise the band must be different than first link and second link)",
+            frequency3);
+cmd.AddValue("emlsrLinks",
+            "The comma separated list of IDs of EMLSR links (for MLDs only)",
+            emlsrLinks);
+cmd.AddValue("emlsrPaddingDelay",
+            "The EMLSR padding delay in microseconds (0, 32, 64, 128 or 256)",
+            paddingDelayUsec);
+cmd.AddValue("emlsrTransitionDelay",
+            "The EMLSR transition delay in microseconds (0, 16, 32, 64, 128 or 256)",
+            transitionDelayUsec);
+cmd.AddValue("emlsrAuxSwitch",
+            "Whether Aux PHY should switch channel to operate on the link on which "
+            "the Main PHY was operating before moving to the link of the Aux PHY. ",
+            switchAuxPhy);
+cmd.AddValue("emlsrAuxChWidth",
+            "The maximum channel width (MHz) supported by Aux PHYs.",
+            auxPhyChWidth);
+cmd.AddValue("emlsrAuxTxCapable",
+            "Whether Aux PHYs are capable of transmitting.",
+            auxPhyTxCapable);
+cmd.AddValue("channelSwitchDelay",
+            "The PHY channel switch delay in microseconds",
+            channelSwitchDelayUsec);
+cmd.AddValue("distance",
+            "Distance in meters between the station and the access point",
+            distance);
+cmd.AddValue("simulationTime", "Simulation time in seconds", simulationTime);
+cmd.AddValue("udp", "UDP if set to 1, TCP otherwise", udp);
+cmd.AddValue("downlink",
+            "Generate downlink flows if set to 1, uplink flows otherwise",
+            downlink);
+cmd.AddValue("useRts", "Enable/disable RTS/CTS", useRts);
+cmd.AddValue("mpduBufferSize",
+            "Size (in number of MPDUs) of the BlockAck buffer",
+            mpduBufferSize);
+cmd.AddValue("nStations", "Number of non-AP EHT stations", nStations);
+cmd.AddValue("dlAckType",
+            "Ack sequence type for DL OFDMA (NO-OFDMA, ACK-SU-FORMAT, MU-BAR, AGGR-MU-BAR)",
+            dlAckSeqType);
+cmd.AddValue("enableUlOfdma",
+            "Enable UL OFDMA (useful if DL OFDMA is enabled and TCP is used)",
+            enableUlOfdma);
+cmd.AddValue("enableBsrp",
+            "Enable BSRP (useful if DL and UL OFDMA are enabled and TCP is used)",
+            enableBsrp);
+cmd.AddValue("mcs", "if set, limit testing to a specific MCS (0-11)", mcs);
+cmd.AddValue("payloadSize", "The application payload size in bytes", payloadSize);
+cmd.AddValue("tputInterval", "duration of intervals for throughput measurement", tputInterval);
+cmd.AddValue("gi", "Guard interval",  gi);
+cmd.AddValue("tracing", "Generate trace files", tracing);
+cmd.AddValue("channelWidth", "channelWidth used",  channelWidth);
+cmd.AddValue("EMLSR_mode", "Flag, true for EMLSR, false for STR",  EMLSR_mode);
+cmd.AddValue("antennas_AP", "Number of antennas for spatial multiplexing",  antennas_AP);
+cmd.AddValue("antennas_Sta", "Number of antennas for spatial multiplexing",  antennas_Sta);
+cmd.AddValue("verbose", "Allowing logging or not",  verbose);
+
+
+cmd.Parse(argc, argv);
+
+if (verbose)
+{
+    LogComponentEnableAll(LOG_PREFIX_ALL);
+    WifiHelper::EnableLogComponents(LOG_ALL); // Turn on all Wifi logging
+    //LogComponentEnable("ChannelAccessManager", LOG_ALL);
+    //LogComponentEnable("EhtFrameExchangeManager", LOG_ALL);
+    //LogComponentEnable("WifiMacQueue", LOG_ALL);
+    //LogComponentEnable("Txop", LOG_ALL);
+    //LogComponentEnable("WifiPhy", LOG_ALL);
+    //LogComponentEnable("EmlsrManager", LOG_ALL);
+    //LogComponentEnable("DefaultEmlsrManager", LOG_ALL);
+    //LogComponentEnable("ApEmlsrManager", LOG_ALL);
+    //LogComponentEnable("DefaultApEmlsrManager", LOG_ALL);
+}
+LatecnyCdfFile.open("LatecnyCdf.txt");
+phyTxTraceFile.open("Phy-tx-trace.txt");
+phyPsduTxTraceFile.open("Phy-psdu-tx-trace.txt");
+phyRxTraceFile.open("Phy-rx-trace.txt");
+packetsTimeStampsFile.open("PacketsTime.txt");
+packetsTimeFile.open("Packets.txt");
+packetsTxfile.open("PacketsTx.txt");
+packetsRxfile.open("PacketsRx.txt");
+
+throughputINCfile.open("ThrInc.txt");
+latecnyINCfile.open("LatInc.txt");
+AvglatecnyINCfile.open("AvgLatInc.txt");
+
+
+
+if (useRts)
+{
+    Config::SetDefault("ns3::WifiRemoteStationManager::RtsCtsThreshold", StringValue("0"));
+    Config::SetDefault("ns3::WifiDefaultProtectionManager::EnableMuRts", BooleanValue(true));
+}
+
+if (dlAckSeqType == "ACK-SU-FORMAT")
+{
+    Config::SetDefault("ns3::WifiDefaultAckManager::DlMuAckSequenceType",
+                    EnumValue(WifiAcknowledgment::DL_MU_BAR_BA_SEQUENCE));
+}
+else if (dlAckSeqType == "MU-BAR")
+{
+    Config::SetDefault("ns3::WifiDefaultAckManager::DlMuAckSequenceType",
+                    EnumValue(WifiAcknowledgment::DL_MU_TF_MU_BAR));
+}
+else if (dlAckSeqType == "AGGR-MU-BAR")
+{
+    Config::SetDefault("ns3::WifiDefaultAckManager::DlMuAckSequenceType",
+                    EnumValue(WifiAcknowledgment::DL_MU_AGGREGATE_TF));
+}
+else if (dlAckSeqType != "NO-OFDMA")
+{
+    NS_ABORT_MSG("Invalid DL ack sequence type (must be NO-OFDMA, ACK-SU-FORMAT, MU-BAR or "
+                "AGGR-MU-BAR)");
+}
+
+// Set A-MPDU and A-MSDU parameters
+//Config::SetDefault("ns3::WifiMac::BE_MaxAmsduSize", UintegerValue(0)); // Set A-MSDU size
+//Config::SetDefault("ns3::WifiMac::BE_MaxAmpduSize", UintegerValue(0)); // Set A-MPDU size
+
+/* Create the station and AP nodes */ 
+NodeContainer wifiStaNodes;
+wifiStaNodes.Create(nStations);
+NodeContainer wifiApNode;
+wifiApNode.Create(1);
+
+NetDeviceContainer apDevice;
+NetDeviceContainer staDevices;
+WifiHelper wifi;
+WifiMacHelper mac;
+
+
+wifi.SetStandard(WIFI_STANDARD_80211be);
+wifi.ConfigHeOptions("GuardInterval", TimeValue(NanoSeconds(gi)));
+
+std::array<std::string, 3> channelStr;
+std::array<FrequencyRange, 3> freqRanges;
+uint64_t nonHtRefRateMbps = EhtPhy::GetNonHtReferenceRate(mcs) / 1e6;
+std::string dataModeStr = "EhtMcs" + std::to_string(mcs);
+std::string ctrlRateStr;           
+uint8_t nLinks = 0;
+
+/*
+if (frequency2 == frequency || frequency3 == frequency ||
+        (frequency3 != 0 && frequency3 == frequency2))
+{
+        NS_FATAL_ERROR("Frequency values must be unique!");
+}
+*/
+
+for (auto freq : {frequency, frequency2, frequency3})
+{   
+    if (nLinks > 0 && freq == 0)
+    {
+            break;
+    }
+    channelStr[nLinks] = "{0, " + std::to_string(channelWidth) + ", ";
+    if (freq == 6)
+    {
+        channelStr[nLinks] += "BAND_6GHZ, 0}";
+        freqRanges[nLinks] = WIFI_SPECTRUM_6_GHZ;
+        Config::SetDefault("ns3::FriisPropagationLossModel::Frequency",
+                                DoubleValue(6e9));
+        wifi.SetRemoteStationManager(nLinks,
+                                    "ns3::ConstantRateWifiManager",
+                                    "DataMode", StringValue(dataModeStr),
+                                    "ControlMode", StringValue(dataModeStr));
+        //wifi.SetRemoteStationManager(nLinks,  "ns3::IdealWifiManager");
+
+    }
+    else if (freq == 5)
+    {
+        channelStr[nLinks] += "BAND_5GHZ, 0}";
+        freqRanges[nLinks] = WIFI_SPECTRUM_5_GHZ;
+        ctrlRateStr = "OfdmRate" + std::to_string(nonHtRefRateMbps) + "Mbps";
+        Config::SetDefault("ns3::FriisPropagationLossModel::Frequency",
+                               DoubleValue(5.180e9));
+        wifi.SetRemoteStationManager(nLinks,
+                                     "ns3::ConstantRateWifiManager",
+                                     "DataMode", StringValue(dataModeStr),
+                                     "ControlMode", StringValue(ctrlRateStr));
+        //wifi.SetRemoteStationManager(nLinks, "ns3::IdealWifiManager");
+    }
+    else if (freq == 2.4)
+    {
+        channelStr[nLinks] += "BAND_2_4GHZ, 0}";
+        freqRanges[nLinks] = WIFI_SPECTRUM_2_4_GHZ;
+        Config::SetDefault("ns3::FriisPropagationLossModel::Frequency",
+                                DoubleValue(2.4e9));
+        ctrlRateStr = "ErpOfdmRate" + std::to_string(nonHtRefRateMbps) + "Mbps";
+        wifi.SetRemoteStationManager(nLinks,
+                                    "ns3::ConstantRateWifiManager",
+                                    "DataMode", StringValue(dataModeStr),
+                                    "ControlMode", StringValue(ctrlRateStr));
+        //wifi.SetRemoteStationManager(nLinks,"ns3::IdealWifiManager");
+    }
+    else
+    {
+        NS_FATAL_ERROR("Wrong frequency value!");
+    }
+    nLinks++;
+}
+
+            
+Ssid ssid = Ssid("ns3-80211be");
+
+SpectrumWifiPhyHelper spectrumWifiPhy(nLinks);
+spectrumWifiPhy.SetPcapDataLinkType(WifiPhyHelper::DLT_IEEE802_11_RADIO);
+spectrumWifiPhy.Set("ChannelSwitchDelay", TimeValue(MicroSeconds(channelSwitchDelayUsec)));
+
+
+for (uint8_t linkId = 0; linkId < nLinks; linkId++)
+{
+    spectrumWifiPhy.Set(linkId, "ChannelSettings", StringValue(channelStr[linkId]));
+    
+    Ptr<MultiModelSpectrumChannel> spectrumChannel = CreateObject<MultiModelSpectrumChannel>();
+    Ptr<FriisPropagationLossModel> lossModel = CreateObject<FriisPropagationLossModel>();
+    spectrumChannel->AddPropagationLossModel(lossModel);
+    Ptr<ConstantSpeedPropagationDelayModel> delayModel = CreateObject<ConstantSpeedPropagationDelayModel>();
+    spectrumChannel->SetPropagationDelayModel(delayModel);
+    spectrumWifiPhy.SetErrorRateModel ("ns3::TableBasedErrorRateModel");
+    //spectrumWifiPhy.SetErrorRateModel ("ns3::LogSgnErrorRateModel");
+    spectrumWifiPhy.SetErrorRateModel ("ns3::LogSgnErrorRateModel", "ChannelModelType",StringValue("ChannelModelD"));
+
+    spectrumWifiPhy.AddChannel(spectrumChannel, freqRanges[linkId]);
+}
+
+for (uint8_t linkId = 0; linkId < nLinks; linkId++)
+{
+    spectrumWifiPhy.Set(linkId, "Antennas", UintegerValue(antennas_Sta)); // At least 2 antennas for 2 RF chains
+    spectrumWifiPhy.Set(linkId, "MaxSupportedRxSpatialStreams", UintegerValue(antennas_Sta)); // Support 2 Rx streams
+    spectrumWifiPhy.Set(linkId, "MaxSupportedTxSpatialStreams", UintegerValue(antennas_Sta)); // Support 2 Tx streams
+}
+
+
+mac.SetType("ns3::StaWifiMac", "Ssid", SsidValue(ssid));
+
+mac.SetEmlsrManager("ns3::DefaultEmlsrManager",
+                   "EmlsrLinkSet",
+                    StringValue(emlsrLinks),
+                    //AttributeContainerValue<UintegerValue>(emlsrLinks),
+                    "EmlsrPaddingDelay",
+                    TimeValue(MicroSeconds(paddingDelayUsec)),
+                    "EmlsrTransitionDelay",
+                    TimeValue(MicroSeconds(transitionDelayUsec)),
+                    "SwitchAuxPhy",
+                    BooleanValue(switchAuxPhy),
+                    "AuxPhyTxCapable",
+                    BooleanValue(auxPhyTxCapable),
+                    "AuxPhyChannelWidth",
+                    UintegerValue(auxPhyChWidth));
+
+if (nLinks > 1 && EMLSR_mode)
+{
+    std::cout << "EMLSR mode is activated " << std::endl;
+    wifi.ConfigEhtOptions("EmlsrActivated", BooleanValue(true));
+}
+else if (nLinks > 1 && !EMLSR_mode)
+{
+    std::cout << "STR mode is activated " << std::endl;
+    wifi.ConfigEhtOptions("EmlsrActivated", BooleanValue(false));
+}
+staDevices = wifi.Install(spectrumWifiPhy, mac, wifiStaNodes);
+
+if (dlAckSeqType != "NO-OFDMA")
+{
+    mac.SetMultiUserScheduler("ns3::RrMultiUserScheduler",
+                                "EnableUlOfdma",
+                                BooleanValue(enableUlOfdma),
+                                "EnableBsrp",
+                                BooleanValue(enableBsrp),
+                                "AccessReqInterval",
+                                TimeValue(accessReqInterval));
+}
+
+for (uint8_t linkId = 0; linkId < nLinks; linkId++)
+{
+    spectrumWifiPhy.Set(linkId, "Antennas", UintegerValue(antennas_AP)); // At least 2 antennas for 2 RF chains
+    spectrumWifiPhy.Set(linkId, "MaxSupportedRxSpatialStreams", UintegerValue(antennas_AP)); // Support 2 Rx streams
+    spectrumWifiPhy.Set(linkId, "MaxSupportedTxSpatialStreams", UintegerValue(antennas_AP)); // Support 2 Tx streams
+}
+
+mac.SetType("ns3::ApWifiMac",
+            "EnableBeaconJitter", BooleanValue(false),
+            "Ssid", SsidValue(ssid));
+apDevice = wifi.Install(spectrumWifiPhy, mac, wifiApNode);
+
+
+
+
+//Config::Set( "/NodeList/*/DeviceList/*/$ns3::WifiNetDevice/HeConfiguration/GuardInterval",
+//            TimeValue(NanoSeconds(gi)));
+Config::Set("/NodeList/*/DeviceList/*/$ns3::WifiNetDevice/Mac/MpduBufferSize",
+            UintegerValue(mpduBufferSize));
+int64_t streamNumber = 100;
+streamNumber += wifi.AssignStreams(apDevice, streamNumber);
+streamNumber += wifi.AssignStreams(staDevices, streamNumber);
+
+
+/*Retrieve parameters of AP only now*/ 
+Ptr<WifiNetDevice> APdeviceaccessed = DynamicCast<WifiNetDevice>(apDevice.Get(0));
+for (uint8_t  i = 0; i < APdeviceaccessed->GetNPhys(); i++)
+{
+    Ptr<WifiPhy> AP_phy = DynamicCast<WifiPhy>(APdeviceaccessed->GetPhy(i));
+    double CCA_threshold  =  AP_phy->GetCcaEdThreshold(); 
+    double CCA_sensitivity  =  AP_phy->GetCcaSensitivityThreshold ();
+    double Rx_Sensitivity =  AP_phy->GetRxSensitivity ();
+    double  Num_antennas  =  AP_phy->GetNumberOfAntennas ();
+    double  PhyId  =  AP_phy->GetPhyId ();
+    double Rx_gain = AP_phy->GetRxGain ();
+    double Tx_gain = AP_phy->GetTxGain ();
+    double TxPowerEnd = AP_phy->GetTxPowerEnd ();
+    double TxPowerStart = AP_phy->GetTxPowerStart ();
+    UintegerValue  Txstreams;
+    UintegerValue  Rxstreams;
+    AP_phy->GetAttribute("MaxSupportedTxSpatialStreams", Txstreams);
+    AP_phy->GetAttribute("MaxSupportedTxSpatialStreams", Rxstreams);
+
+    std::cout << "PhyId " << PhyId << std::endl;
+    //std::cout << "slot_t " << slot_t << std::endl;
+    std::cout << "TxPowerEnd in dBm " << TxPowerEnd << std::endl;
+    std::cout << "TxPowerStart in dBm " << TxPowerStart << std::endl;
+    std::cout << "Rx_gain in dB " << Rx_gain << std::endl;
+    std::cout << "Tx_gain in dB " << Tx_gain << std::endl;
+    std::cout << "Num_antennas " << Num_antennas << std::endl;
+    std::cout << "Txstreams " << Txstreams.Get() << std::endl;
+    std::cout << "Rxstreams " << Rxstreams.Get() << std::endl;
+    std::cout << "CCA_threshold " << CCA_threshold << std::endl;
+    std::cout << "CCA_sensitivity " << CCA_sensitivity << std::endl;
+    std::cout << "Rx_Sensitivity " << Rx_Sensitivity << std::endl;
+}
+
+// Retrieve the parameters of the MAC layer
+Ptr<ApWifiMac> AP_mac = DynamicCast<ApWifiMac>(APdeviceaccessed->GetMac());
+
+uint8_t Num_links = AP_mac->GetNLinks() ;
+std::cout << "Number of links " << static_cast<int>(Num_links)  << std::endl;
+
+bool check_QOS_supp = AP_mac->GetQosSupported ();
+std::cout << "Is_QOS_Supp " << check_QOS_supp << std::endl;
+
+//When a packet is received by the MAC, to be sent to the PHY, it is queued in the internal queue after being tagged by the current time.
+//so it saves the packets and tag it with the current time until 
+Ptr< WifiMacQueue > Mac_queue_BE = DynamicCast<WifiMacQueue>(AP_mac->GetTxopQueue (AC_BE));
+Ptr< WifiMacQueue > Mac_queue_VO = DynamicCast<WifiMacQueue>(AP_mac->GetTxopQueue (AC_VO));
+auto maxSize = Mac_queue_BE->GetMaxSize();
+std::cout << "MaxSize_queue : " << maxSize << std::endl;
+uint32_t NumPackets_BE = Mac_queue_BE->GetNPackets();
+std::cout << "NumPackets_BE " << NumPackets_BE << std::endl;
+uint32_t NumPackets_VO = Mac_queue_VO->GetNPackets();
+std::cout << "NumPackets_VO " << NumPackets_VO << std::endl;
+
+for (uint8_t  linkId = 0; linkId < Num_links; linkId++)
+{   
+    std::cout << "For link " << static_cast<unsigned int>(linkId) << std::endl; 
+    Ptr<QosTxop> QOS_EDCA = DynamicCast<QosTxop>(AP_mac->GetQosTxop(AC_BE));
+    Time TXOPLimit = QOS_EDCA->GetTxopLimit(linkId);
+    uint32_t MinCW = QOS_EDCA->GetMinCw(linkId);
+    uint32_t MaxCW = QOS_EDCA->GetMaxCw(linkId);
+    std::cout << "TXOPLimit " << TXOPLimit << std::endl;
+    std::cout << "MinCW " << MinCW << std::endl;
+    std::cout << "MaxCW " << MaxCW << std::endl;
+}
+
+
+if (nLinks > 1)
+{
+    Ptr<WifiNetDevice> AP_device_check = DynamicCast<WifiNetDevice>(apDevice.Get(1));
+}
+
+for (uint8_t linkId = 0; linkId < AP_mac->GetNLinks(); linkId++)
+{    
+    Ptr< ChannelAccessManager > CEM = DynamicCast<ChannelAccessManager>(AP_mac->GetChannelAccessManager (linkId));
+} 
+// Recall the  (MLD) address associated with a Wi-Fi MAC entity that is part of an MLD. 
+//The MLD address is a unique MAC address that identifies the entire MLD entity, which may consist of multiple links (interfaces).
+Mac48Address mac48Address = Mac48Address::ConvertFrom (APdeviceaccessed->GetAddress());
+std::cout << "MLD address : " << mac48Address << std::endl;
+
+for (uint8_t linkId = 0; linkId < AP_mac->GetNLinks(); linkId++)
+{    
+    Ptr< FrameExchangeManager > FEM = DynamicCast<FrameExchangeManager>(AP_mac->GetFrameExchangeManager (linkId)); 
+    std::cout << "Mac address of Link no: " << static_cast<int>(linkId) << " is " << FEM->GetAddress() << std::endl;
+} 
+
+for (uint8_t linkId = 0; linkId < AP_mac->GetNLinks(); linkId++)
+{    
+    Ptr< WifiRemoteStationManager > WSM = 
+        DynamicCast<WifiRemoteStationManager>(AP_mac->GetWifiRemoteStationManager (linkId));
+} 
+
+// Check current A-MPDU and A-MSDU values
+uint32_t maxAmpduSize = AP_mac->GetMaxAmpduSize(AC_BE) ;
+uint16_t msduAggregation = AP_mac->GetMaxAmsduSize(AC_BE) ;
+
+
+std::cout << "Default BE_MaxAmpduSize: " << maxAmpduSize << std::endl;
+std::cout << "Default BE_MsduAggregator: " << msduAggregation << std::endl;
+
+/* Mobility */
+MobilityHelper mobility;
+Ptr<ListPositionAllocator> positionAlloc = CreateObject<ListPositionAllocator>();
+positionAlloc->Add(Vector(0.0, 0.0, 0.0));
+mobility.SetPositionAllocator(positionAlloc);
+mobility.Install(wifiApNode);
+
+// Configure mobility for STAs of TAP (randomly distributed around AP1 within 10 meters)
+//mobility.SetPositionAllocator("ns3::RandomDiscPositionAllocator",
+//                                "X", DoubleValue(0.0), // AP at center X=0
+//                                "Y", DoubleValue(0.0), // AP at center Y=0
+//                                "Rho", StringValue("ns3::UniformRandomVariable[Min=0.0|Max=" + std::to_string(distance) + "]"));
+Vector ap1Position(0.0, 0.0, 0.0); // AP1 at origin
+double radius =  std::sqrt(std::pow(distance, 2) + std::pow(distance, 2));
+for (uint32_t i = 0; i < nStations; ++i)
+{
+    double angle = 2 * M_PI * i / nStations; // Evenly space stations
+    double x = ap1Position.x + radius * std::cos(angle);
+    double y = ap1Position.y + radius * std::sin(angle);
+    positionAlloc->Add(Vector(x, y, 0.0));
+}
+mobility.SetPositionAllocator(positionAlloc);
+mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
+mobility.Install(wifiStaNodes);
+
+
+/* Internet stack*/
+streamNumber += wifi.AssignStreams(apDevice, streamNumber);
+streamNumber += wifi.AssignStreams(staDevices, streamNumber);
+
+InternetStackHelper stack;
+stack.Install(wifiApNode);
+stack.Install(wifiStaNodes);
+streamNumber += stack.AssignStreams(wifiApNode, streamNumber);
+streamNumber += stack.AssignStreams(wifiStaNodes, streamNumber);
+
+Ipv4AddressHelper address;
+address.SetBase("192.168.1.0", "255.255.255.0");
+Ipv4InterfaceContainer staNodeInterfaces;
+Ipv4InterfaceContainer apNodeInterface;
+
+staNodeInterfaces = address.Assign(staDevices);
+apNodeInterface = address.Assign(apDevice);
+
+
+/* Applications */
+auto maxRate =  EhtPhy::GetDataRate(mcs, channelWidth, gi, 1) / nStations;
+maxRate = 86 * 4 * 1000000;
+//maxRate = 50 * 1000000;
+//auto maxRate =  nLinks * EhtPhy::GetDataRate(mcs, channelWidth, gi, antennas) / nStations;
+//maxRate = payloadSize*8;
+std::cout << "maxRate " << maxRate/1000000 << std::endl;
+
+/*Setting applications*/
+ApplicationContainer serverApp;
+Ipv4InterfaceContainer serverInterfaces;
+auto serverNodes = std::ref(wifiStaNodes); 
+for (std::size_t i = 0; i < nStations; i++)
+{
+    serverInterfaces.Add(staNodeInterfaces.Get(i));
+}
+ uint16_t port = 9;
+UdpServerHelper server(port);
+serverApp = server.Install(serverNodes.get());
+streamNumber += server.AssignStreams(serverNodes.get(), streamNumber);
+serverApp.Start(Seconds(0.0));
+serverApp.Stop(simulationTime + Seconds(1.0));
+
+NodeContainer clientNodes;
+clientNodes.Add(wifiApNode.Get(0));
+//double  maxRate_lower = maxRate * 0.1;
+const auto packetInterval = payloadSize * 8.0 / maxRate;  // For calculating the duration of the packet
+std::cout << "packetInterval " << packetInterval << std::endl;
+//4294967295U
+//number_packets = 5000 * 1.0;
+
+for (std::size_t i = 0; i < nStations; i++)
+{
+    UdpClientHelper client(serverInterfaces.GetAddress(i), port);
+    client.SetAttribute("MaxPackets", UintegerValue(number_packets));
+    client.SetAttribute("Interval", TimeValue(Seconds(packetInterval)));
+    client.SetAttribute("PacketSize", UintegerValue(payloadSize));
+    ApplicationContainer clientApp = client.Install(clientNodes.Get(0));
+    streamNumber += client.AssignStreams(clientNodes.Get(0), streamNumber);
+
+    clientApp.Start(Seconds(1.0));
+    clientApp.Stop(simulationTime + Seconds(1.0));
+}
+
+
+    
+    
+
+// Install FlowMonitor 
+FlowMonitorHelper flowmon;
+Ptr<FlowMonitor> monitor = flowmon.InstallAll ();
+
+if (enablePcap)
+{
+    spectrumWifiPhy.EnablePcap("wifi_7_test", apDevice);
+}
+
+/*Trace sources*/
+Config::Connect("/NodeList/*/ApplicationList/*/$ns3::UdpClient/TxWithAddresses",
+        MakeCallback(&ClientTxAdd));
+
+Config::Connect("/NodeList/*/ApplicationList/*/$ns3::UdpServer/RxWithAddresses",
+    MakeCallback(&ServerRxAdd));
+
+//Config::ConnectWithoutContext("/NodeList/*/DeviceList/*/$ns3::WifiNetDevice/Phys/" + std::to_string(0) + "/PhyTxPsduBegin",
+//      MakeCallback(&PhyTxTraceParameters));
+
+  
+//Config::ConnectWithoutContext("/NodeList/*/DeviceList/*/$ns3::WifiNetDevice/RemoteStationManagers/0/$ns3::IdealWifiManager/Rate",
+//          MakeCallback(&RateChange));
+
+
+//Config::ConnectWithoutContext("/NodeList/*/ApplicationList/*/$ns3::PacketSink/Rx",
+//          MakeCallback(&PacketArrivalCallback));
+
+
+
+//for (uint8_t phyId = 0; phyId < AP_mac->GetDevice()->GetNPhys(); phyId++)
+//{
+//    Config::ConnectWithoutContext("/NodeList/0/DeviceList/*/$ns3::WifiNetDevice/Phys/" + std::to_string(phyId) + "/PhyTxPsduBegin",
+//            MakeCallback(&Transmit).Bind(phyId));
+//}
+
+
+//uint8_t phyId_psdu_0 = 0;
+//Config::ConnectWithoutContext("/NodeList/*/DeviceList/*/$ns3::WifiNetDevice/Phys/" + std::to_string(phyId_psdu_0) + "/PhyTxPsduBegin",
+//            MakeCallback(&Transmit).Bind(phyId_psdu_0));
+//uint8_t phyId_psdu_1 = 1;
+//Config::ConnectWithoutContext("/NodeList/*/DeviceList/*/$ns3::WifiNetDevice/Phys/" + std::to_string(phyId_psdu_1) + "/PhyTxPsduBegin",
+//            MakeCallback(&Transmit).Bind(phyId_psdu_1));
+
+
+
+uint8_t phyId_0 = 0;
+Config::ConnectWithoutContext("/NodeList/*/DeviceList/*/$ns3::WifiNetDevice/Phys/" + std::to_string(phyId_0) + "/PhyTxBegin",
+       MakeCallback(&PhyTxTest));
+Config::ConnectWithoutContext("/NodeList/*/DeviceList/*/$ns3::WifiNetDevice/Phys/" + std::to_string(phyId_0) + "/PhyTxPsduBegin",
+       MakeCallback(&PhyTxPSDUTest));
+//uint8_t phyId_1 = 1;
+//Config::ConnectWithoutContext("/NodeList/*/DeviceList/*/$ns3::WifiNetDevice/Phys/" + std::to_string(phyId_1) + "/PhyTxBegin",
+//       MakeCallback(&PhyTxTrace));
+Config::ConnectWithoutContext("/NodeList/*/DeviceList/*/$ns3::WifiNetDevice/Phys/" + std::to_string(phyId_0) + "/PhyRxEnd",
+       MakeCallback(&PhyRxDoneTrace));
+//uint8_t phyId_1 = 1;
+//Config::ConnectWithoutContext("/NodeList/*/DeviceList/*/$ns3::WifiNetDevice/Phys/" + std::to_string(phyId_1) + "/PhyRxEnd",
+//       MakeCallback(&PhyRxDoneTrace));
+
+
+
+//Ptr<ApWifiMac> AP_mac_ag = DynamicCast<ApWifiMac>(APdeviceaccessed->GetMac());
+//Ptr<QosTxop> QOS_EDCA_ag = DynamicCast<QosTxop>(AP_mac_ag->GetQosTxop(AC_BE));
+//QOS_EDCA_ag->TraceConnectWithoutContext("BackoffTrace", MakeCallback(&BackoffTrace));
+
+/* Save the current configuration to an XML file
+Config::SetDefault("ns3::ConfigStore::Filename", StringValue("output-attributes.txt"));
+Config::SetDefault("ns3::ConfigStore::FileFormat", StringValue("RawText"));
+Config::SetDefault("ns3::ConfigStore::Mode", StringValue("Save"));
+ConfigStore outputConfig2;
+outputConfig2.ConfigureDefaults();
+outputConfig2.ConfigureAttributes();
+*/
+
+
+/* Now for calculating the throughput. The client, AP is the one tranmitting
+Usually in one link, you just need to schedule the time of distributing the 
+routing tables. which will be as following but unfortunately here you cannot use that with more
+than one link connected to the same netdevice 
+Simulator::Schedule(Seconds(0), Ipv4GlobalRoutingHelper::PopulateRoutingTables);
+*/
+
+
+std::vector<uint64_t> cumulRxBytes(nStations, 0);
+if (tputInterval.IsStrictlyPositive())
+{
+    /*
+    Simulator::Schedule(Seconds(0.1) + tputInterval, 
+                        &PrintIntermediateTput,
+                        &cumulRxBytes, 
+                        &serverApp, 
+                        payloadSize, 
+                        tputInterval,
+                        simulationTime + Seconds(1.0));
+    */
+    /*
+    Simulator::Schedule(Seconds(0.1) + tputInterval, 
+                        &PrintTputIncrement,
+                        &serverApp, 
+                        &sendTimestamps,
+                        &receiveTimestamps,
+                        payloadSize, 
+                        tputInterval,
+                        simulationTime + Seconds(1.0));
+    
+   
+    Simulator::Schedule(Seconds(0.1) + tputInterval, 
+                        &PrintLatencyIncrement,
+                        &serverApp, 
+                        &sendTimestamps,
+                        &receiveTimestamps,
+                        payloadSize, 
+                        tputInterval,
+                        simulationTime + Seconds(1.0));
+    */
+}
+
+Simulator::Stop(simulationTime + Seconds(1));
+Simulator::Run();
+
+
+
+phyTxTraceFile.flush();
+phyPsduTxTraceFile.flush();
+phyRxTraceFile.flush();
+
+packetsTimeStampsFile.flush();
+packetsTimeFile.flush();
+packetsTxfile.flush();
+packetsRxfile.flush();
+throughputINCfile.flush();
+latecnyINCfile.flush();
+AvglatecnyINCfile.flush();
+
+
+/* Caclulate the throughput from the server at the application layer */
+/*
+uint64_t totalPacketsThrough = 0;
+std::vector<double> Sta_Throughput(nStations);
+
+for (uint32_t i = 0; i < serverApp.GetN(); i++)
+{
+    totalPacketsThrough =  DynamicCast<UdpServer>(serverApp.Get(i))->GetReceived();
+    std::cout << "Received packets by sta: " << i+1 << " is " << DynamicCast<UdpServer>(serverApp.Get(i))->GetReceived() << std::endl;
+    Sta_Throughput[i] = (totalPacketsThrough * payloadSize * 8) / (simulationTime.GetSeconds() * 1000000.0); // Mbit/s
+}
+
+std::cout << "Throughput of stations are " << " ";
+for (uint32_t count = 0; count <  serverApp.GetN(); count++) 
+{
+    std::cout <<  Sta_Throughput[count]  << ", " << " ";
+}
+std::cout << std::endl;   
+double rxBytes = 0;
+for (uint32_t i = 0; i < serverApp.GetN(); i++)
+{
+    rxBytes +=
+          payloadSize * DynamicCast<UdpServer>(serverApp.Get(i))->GetReceived();
+}
+double tot_throughput = (rxBytes * 8) / (simulationTime.GetSeconds() * 1000000.0); // Mbit/s
+std::cout << "Total throughput " <<  tot_throughput  << std::endl;
+*/
+
+/* Print per flow statistics */
+monitor->CheckForLostPackets ();
+Ptr<Ipv4FlowClassifier> classifier = DynamicCast<Ipv4FlowClassifier> (flowmon.GetClassifier ());
+std::map<FlowId, FlowMonitor::FlowStats> stats = monitor->GetFlowStats ();
+
+double through = 0;
+double delay = 0;
+double txed_packets = 0;
+double rxed_packets = 0;
+double lost_packets = 0;
+std::size_t jStataions = 0; // Index for timeDiff
+std::vector<double> thrStations(nStations , 0.0);
+std::cout << std::setw(5) << "Delay(s) " << std::setw(15) << "Txed packets " << std::setw(13) << "Rxed packets "
+          << std::setw(12) << "Lost packets " <<  std::setw(10) << "Datarate" << std::setw(15) << "Throughput " 
+          << std::endl;
+for (std::map<FlowId, FlowMonitor::FlowStats>::const_iterator i = stats.begin (); i != stats.end (); ++i)
+{   
+    Ipv4FlowClassifier::FiveTuple t = classifier->FindFlow (i->first);
+    std::cout << "Flow " << i->first << " (" << t.sourceAddress << " -> " << t.destinationAddress << ")\n";
+    //std::cout << "  Tx Bytes:   " << i->second.txBytes << "\n";
+    //std::cout << "  Rx Bytes:   " << i->second.rxBytes << "\n";
+    through = i->second.rxBytes * 8.0 / (i->second.timeLastRxPacket.GetSeconds () - i->second.timeFirstTxPacket.GetSeconds ()) / 1024 / 1024;
+    //std::cout << "Time last packet received " << i->second.rxBytes<< "\n";
+    delay = (i->second.delaySum.GetSeconds())/(i->second.rxPackets);
+    //std::cout << "  Delay sum:  " << (i->second.delaySum.GetSeconds()) << "\n";
+    txed_packets = (i->second.txPackets);
+    //std::cout << "  txed packets: " << (i->second.txPackets)<< "\n";
+    rxed_packets = (i->second.rxPackets);
+    //std::cout << "  rxed packets: " << (i->second.rxPackets)<< "\n";
+    lost_packets = (i->second.lostPackets);
+    //std::cout << "  lost packets: " << (i->second.lostPackets)<< "\n";
+    std::cout << std::setw(5) << delay << std::setw(10) << txed_packets << std::setw(13) << rxed_packets
+              << std::setw(12) << lost_packets  << std::setw(12) << (maxRate/1000000) << std::setw(15)
+              << through << std::endl;
+    thrStations[jStataions] = through;
+    jStataions ++;
+}
+
+double aggregateThroughput = 0.0; // in bits
+for (std::size_t i = 0; i < nStations; ++i) {
+    aggregateThroughput += thrStations[i]; // in bits
+}
+std::cout << "Aggregate Throughput: " << aggregateThroughput << " Mbps" << std::endl;
+
+
+double sumThroughput = 0.0;
+double sumThroughputSquared = 0.0;
+for (std::size_t i = 0; i < nStations; ++i) {
+    sumThroughput += thrStations[i];
+    sumThroughputSquared += thrStations[i] * thrStations[i];
+}
+
+double fairnessIndex = (sumThroughput * sumThroughput) / (nStations * sumThroughputSquared);
+std::cout << "Jain's Fairness Index: " << fairnessIndex << std::endl;
+
+
+// Print the send and receive time stamps maps 
+//PrintSendTimestamps(sendTimestamps);
+//PrintReceiveTimestamps(receiveTimestamps);
+CalculateLatencies();
+//PrintEachLatency();
+//PrintAverageLatency();
+
+LatecnyCdfFile.flush();
+for (const auto& entry : packetLatencies) {
+    // Write the latencies as a comma-separated list
+    for (size_t i = 0; i < entry.second.size(); ++i) {
+        LatecnyCdfFile << entry.second[i];
+        if (i != entry.second.size() - 1) {
+            LatecnyCdfFile << ",";
+        }
+    }
+    LatecnyCdfFile << std::endl;
+}
+LatecnyCdfFile.close();
+
+phyTxTraceFile.close();
+phyPsduTxTraceFile.close();
+phyRxTraceFile.close();
+packetsTimeStampsFile.close();
+packetsTimeFile << std::endl;
+packetsTimeFile.close();
+packetsTxfile.close();
+packetsRxfile.close();
+throughputINCfile.close();
+latecnyINCfile.close();
+AvglatecnyINCfile.close();
+
+
+Simulator::Destroy();
+return 0;
+}   
