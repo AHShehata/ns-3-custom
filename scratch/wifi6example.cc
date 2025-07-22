@@ -44,29 +44,7 @@
 
 #include <functional>
 
-// This is a simple example in order to show how to configure an IEEE 802.11ax Wi-Fi network.
-//
-// It outputs the UDP or TCP goodput for every HE MCS value, which depends on the MCS value (0 to
-// 11), the channel width (20, 40, 80 or 160 MHz) and the guard interval (800ns, 1600ns or 3200ns).
-// The PHY bitrate is constant over all the simulation run. The user can also specify the distance
-// between the access point and the station: the larger the distance the smaller the goodput.
-//
-// The simulation assumes a configurable number of stations in an infrastructure network:
-//
-//  STA     AP
-//    *     *
-//    |     |
-//   n1     n2
-//
-// Packets in this simulation belong to BestEffort Access Class (AC_BE).
-// By selecting an acknowledgment sequence for DL MU PPDUs, it is possible to aggregate a
-// Round Robin scheduler to the AP, so that DL MU PPDUs are sent by the AP via DL OFDMA.
 
-
-// An infrastructure network in Wi-Fi refers to a wireless network configuration where devices (clients or stations) communicate with each other via an access point (AP). 
-// This is the most common mode of operation for Wi-Fi networks, such as those found in homes, offices, and public spaces.
-
-// In ns-3, an infrastructure Wi-Fi network can be simulated by setting up access points and stations. 
 using namespace ns3;
 
 NS_LOG_COMPONENT_DEFINE("he-wifi-network");
