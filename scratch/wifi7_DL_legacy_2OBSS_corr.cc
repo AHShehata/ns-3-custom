@@ -71,21 +71,8 @@
  #include <chrono>
  
  
- 
- // This is an example of  how to configure an IEEE 802.11be Wi-Fi network.
- // The simulation assumes a configurable number of stations in an infrastructure network:
- //  STA     AP
- //    *     *
- //    |     |
- //   n1     n2
- //
- // Packets in this simulation belong to BestEffort Access Class (AC_BE).
- // By selecting an acknowledgment sequence for DL MU PPDUs, it is possible to aggregate a
- // Round Robin scheduler to the AP, so that DL MU PPDUs are sent by the AP via DL OFDMA.
- 
- 
  using namespace ns3;
- NS_LOG_COMPONENT_DEFINE("eht-wifi-networktrial");
+ NS_LOG_COMPONENT_DEFINE("EHT_wifi-network");
  std::ofstream LatecnyCdfFile;
  
  
@@ -310,13 +297,13 @@
  
  // Parameters 
  bool udp{true}; // Application used either TCP/UDP
- bool downlink{true}; // Downlink/ UL
- bool useRts{true}; //Use RTS/CTS or not
+ bool downlink{true};    // Downlink/ UL
+ bool useRts{true};      //Use RTS/CTS or not
  Time simulationTime{"10s"}; //seconds
  double distance{10.0};      // meters
  std::size_t nStationsT{1};
  uint16_t nStationsL = 1;
- double frequency{2.4};       // whether the first link operates in the 2.4s, 5 or 6 GHz
+ double frequency{2.4};  // whether the first link operates in the 2.4s, 5 or 6 GHz
  double frequency2{0}; // whether the second link operates in the 2.4, 5 or 6 GHz (0 means no second link exists)
  double frequency3{0}; // whether the third link operates in the 2.4, 5 or 6 GHz (0 means no third link exists)
  int mcs{7}; // -1 indicates an unset value
@@ -338,7 +325,7 @@
  
  
  /* EMLSR Parameters */ 
- std::string emlsrLinks = "0";
+ std::string emlsrLinks = "0";   // Comma sepearated link ids
  //std::string emlsrLinks = "0,1";
  //std::string emlsrLinks = "0,1,2";
  uint16_t Links_number{1};
@@ -351,19 +338,19 @@
  bool switchAuxPhy{true};
  bool auxPhyTxCapable{true};
  uint16_t auxPhyChWidth{20};
- bool EMLSR_mode{true};     // Switch between STR and EMLSR modes
+ bool EMLSR_mode{true};     // Switch between STR and EMLSR modes, True enabling EMLSR
  
  
  /*OBSS Parameters*/
  uint32_t nBSSs = 3;
  int mcs_OBSS = 7;
- double traffic_load_BBS1{1.0};  // Factor determin the chanel congestion on the band of different BSSs
- double traffic_load_BBS2{1.0};  // Factor determin the chanel congestion on the band of different BSSs
- double& traffic_load_BBS3 = traffic_load_BBS2;  // Factor determin the chanel congestion on the band of different BSSs
- double& traffic_load_BBS4 = traffic_load_BBS2;  // Factor determin the chanel congestion on the band of different BSSs
- double& traffic_load_BBS5 = traffic_load_BBS2 ;  // Factor determin the chanel congestion on the band of different BSSs
- double& traffic_load_BBS6 = traffic_load_BBS2;  // Factor determin the chanel congestion on the band of different BSSs
- double& traffic_load_BBS7 = traffic_load_BBS2;  // Factor determin the chanel congestion on the band of different BSSs
+ double traffic_load_BBS1{1.0};  // Factor determine the chanel congestion on the band of different BSSs
+ double traffic_load_BBS2{1.0};  // Factor determine the chanel congestion on the band of different BSSs
+ double& traffic_load_BBS3 = traffic_load_BBS2;  // Factor determine the chanel congestion on the band of different BSSs
+ double& traffic_load_BBS4 = traffic_load_BBS2;  // Factor determine the chanel congestion on the band of different BSSs
+ double& traffic_load_BBS5 = traffic_load_BBS2 ;  // Factor determine the chanel congestion on the band of different BSSs
+ double& traffic_load_BBS6 = traffic_load_BBS2;  // Factor determine the chanel congestion on the band of different BSSs
+ double& traffic_load_BBS7 = traffic_load_BBS2;  // Factor determine the chanel congestion on the band of different BSSs
  
  //double d1 = 30.0;            // meters
  //double d2 = 30.0;            // meters
@@ -410,10 +397,10 @@
  
  double dSta = 10; //meters
  double dAP = 150;  //meters
- uint32_t Number_runs = 1;
- uint16_t antennas_AP = 1;
-uint16_t antennas_Sta = 1;
- uint16_t antennas_OBSS = 1;
+ uint32_t Number_runs = 1;   // number of seeds per run
+ uint16_t antennas_AP = 1;   // number of antennas of the AP of the target AP
+uint16_t antennas_Sta = 1;   // number of antennas of the station
+ uint16_t antennas_OBSS = 1; // number of antennas of the AP of the OBSS APs
  
  
  // Parsing using the commandline 
