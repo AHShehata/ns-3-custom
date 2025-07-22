@@ -13,8 +13,7 @@
  * You should have received a copy of the GNU General Public License
  * along with this program; if not, write to the Free Software
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
- *
- * Author: Sebastien Deronne <sebastien.deronne@gmail.com>
+
  */
 
  #include "ns3/boolean.h"
@@ -72,18 +71,6 @@
  #include "ns3/rng-seed-manager.h"
  #include <chrono>
  
- 
- 
- // This is an example of  how to configure an IEEE 802.11be Wi-Fi network.
- // The simulation assumes a configurable number of stations in an infrastructure network:
- //  STA     AP
- //    *     *
- //    |     |
- //   n1     n2
- //
- // Packets in this simulation belong to BestEffort Access Class (AC_BE).
- // By selecting an acknowledgment sequence for DL MU PPDUs, it is possible to aggregate a
- // Round Robin scheduler to the AP, so that DL MU PPDUs are sent by the AP via DL OFDMA.
  
  
  using namespace ns3;
