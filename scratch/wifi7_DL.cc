@@ -69,19 +69,6 @@
 #include <cstdint>  // For uint8_t
 
 
-
-// This is an example of  how to configure an IEEE 802.11be Wi-Fi network.
-// The simulation assumes a configurable number of stations in an infrastructure network:
-//  STA     AP
-//    *     *
-//    |     |
-//   n1     n2
-//
-// Packets in this simulation belong to BestEffort Access Class (AC_BE).
-// By selecting an acknowledgment sequence for DL MU PPDUs, it is possible to aggregate a
-// Round Robin scheduler to the AP, so that DL MU PPDUs are sent by the AP via DL OFDMA.
-
-
 using namespace ns3;
 NS_LOG_COMPONENT_DEFINE("eht-wifi-networktrial");
 std::ofstream LatecnyCdfFile;
